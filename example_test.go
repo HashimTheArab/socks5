@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/miekg/dns"
-	"github.com/txthinking/socks5"
+	"github.com/hashimthearab/socks5"
 )
 
 func ExampleServer() {

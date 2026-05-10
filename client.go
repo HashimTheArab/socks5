@@ -1,7 +1,9 @@
 package socks5
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net"
 	"time"
 )
@@ -36,9 +38,32 @@ func (c *Client) Dial(network, addr string) (net.Conn, error) {
 	return c.DialWithLocalAddr(network, "", addr, nil)
 }
 
+func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return c.DialWithLocalAddrContext(ctx, network, "", addr, nil)
+}
+
 // If you want to send address that expects to use to send UDP, just assign it to src, otherwise it will send zero address.
 // Recommend specifying the src address in a non-NAT environment, and leave it blank in other cases.
 func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr) (net.Conn, error) {
+	return c.dialWithLocalAddr(context.Background(), network, src, dst, remoteAddr, false)
+}
+
+func (c *Client) DialWithLocalAddrContext(ctx context.Context, network, src, dst string, remoteAddr net.Addr) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.dialWithLocalAddr(ctx, network, src, dst, remoteAddr, true)
+}
+
+func (c *Client) dialWithLocalAddr(ctx context.Context, network, src, dst string, remoteAddr net.Addr, useContext bool) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if useContext {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	c = &Client{
 		Server:        c.Server,
 		UserName:      c.UserName,
@@ -57,9 +82,15 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 				return nil, err
 			}
 		}
-		if err := c.Negotiate(laddr); err != nil {
+		if err := c.negotiateForDial(ctx, laddr, useContext); err != nil {
 			return nil, err
 		}
+		dialSucceeded := false
+		defer func() {
+			if !dialSucceeded {
+				_ = c.Close()
+			}
+		}()
 		a, h, p, err := ParseAddress(dst)
 		if err != nil {
 			return nil, err
@@ -67,9 +98,10 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 		if a == ATYPDomain {
 			h = h[1:]
 		}
-		if _, err := c.Request(NewRequest(CmdConnect, a, h, p)); err != nil {
+		if _, err := c.requestForDial(ctx, useContext, NewRequest(CmdConnect, a, h, p)); err != nil {
 			return nil, err
 		}
+		dialSucceeded = true
 		return c, nil
 	}
 	if network == "udp" {
@@ -80,9 +112,15 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 				return nil, err
 			}
 		}
-		if err := c.Negotiate(laddr); err != nil {
+		if err := c.negotiateForDial(ctx, laddr, useContext); err != nil {
 			return nil, err
 		}
+		dialSucceeded := false
+		defer func() {
+			if !dialSucceeded {
+				_ = c.Close()
+			}
+		}()
 
 		a, h, p := ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00}
 		if src != "" {
@@ -94,22 +132,61 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 				h = h[1:]
 			}
 		}
-		rp, err := c.Request(NewRequest(CmdUDP, a, h, p))
+		rp, err := c.requestForDial(ctx, useContext, NewRequest(CmdUDP, a, h, p))
 		if err != nil {
 			return nil, err
 		}
-		c.UDPConn, err = DialUDP("udp", src, rp.Address())
+		if useContext {
+			c.UDPConn, err = DialUDPContext(ctx, "udp", src, rp.Address())
+		} else {
+			c.UDPConn, err = DialUDP("udp", src, rp.Address())
+		}
 		if err != nil {
-			return nil, err
+			return nil, contextError(ctx, err)
+		}
+		if useContext {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		if c.UDPTimeout != 0 {
 			if err := c.UDPConn.SetDeadline(time.Now().Add(time.Duration(c.UDPTimeout) * time.Second)); err != nil {
 				return nil, err
 			}
 		}
+		dialSucceeded = true
 		return c, nil
 	}
 	return nil, errors.New("unsupport network")
+}
+
+func (c *Client) negotiateForDial(ctx context.Context, laddr net.Addr, useContext bool) error {
+	if useContext {
+		return c.NegotiateContext(ctx, laddr)
+	}
+	return c.Negotiate(laddr)
+}
+
+func (c *Client) requestForDial(ctx context.Context, useContext bool, r *Request) (*Reply, error) {
+	if !useContext {
+		return c.Request(r)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stopCancel := closeOnContextCancel(ctx, c.TCPConn)
+	rp, err := c.Request(r)
+	canceled := stopCancel()
+	if err != nil {
+		return nil, contextError(ctx, err)
+	}
+	if canceled {
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return rp, nil
 }
 
 func (c *Client) Read(b []byte) (int, error) {
@@ -206,6 +283,45 @@ func (c *Client) Negotiate(laddr net.Addr) error {
 	if err != nil {
 		return err
 	}
+	if err := c.negotiate(); err != nil {
+		_ = c.TCPConn.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) NegotiateContext(ctx context.Context, laddr net.Addr) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	src := ""
+	if laddr != nil {
+		src = laddr.String()
+	}
+	var err error
+	c.TCPConn, err = DialTCPContext(ctx, "tcp", src, c.Server)
+	if err != nil {
+		return contextError(ctx, err)
+	}
+	stopCancel := closeOnContextCancel(ctx, c.TCPConn)
+	err = c.negotiate()
+	canceled := stopCancel()
+	if err != nil {
+		_ = c.TCPConn.Close()
+		return contextError(ctx, err)
+	}
+	if canceled {
+		_ = c.TCPConn.Close()
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		_ = c.TCPConn.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) negotiate() error {
 	if c.TCPTimeout != 0 {
 		if err := c.TCPConn.SetDeadline(time.Now().Add(time.Duration(c.TCPTimeout) * time.Second)); err != nil {
 			return err
@@ -240,6 +356,46 @@ func (c *Client) Negotiate(laddr net.Addr) error {
 		}
 	}
 	return nil
+}
+
+func closeOnContextCancel(ctx context.Context, c io.Closer) func() bool {
+	if ctx == nil || ctx.Done() == nil || c == nil {
+		return func() bool { return false }
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	closed := make(chan struct{}, 1)
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+			closed <- struct{}{}
+		case <-done:
+		}
+	}()
+	return func() bool {
+		close(done)
+		<-stopped
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func contextError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
 }
 
 func (c *Client) Request(r *Request) (*Reply, error) {
