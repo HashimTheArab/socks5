@@ -5,8 +5,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"time"
 )
+
+const maxUDPDatagramSize = 65535
 
 // Client is socks5 client wrapper
 type Client struct {
@@ -72,6 +75,9 @@ func (c *Client) dialWithLocalAddr(ctx context.Context, network, src, dst string
 		UDPTimeout:    c.UDPTimeout,
 		Dst:           dst,
 		RemoteAddress: remoteAddr,
+	}
+	if c.RemoteAddress == nil {
+		c.RemoteAddress = resolveClientRemoteAddr(network, dst)
 	}
 	var err error
 	if network == "tcp" {
@@ -193,16 +199,20 @@ func (c *Client) Read(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Read(b)
 	}
-	n, err := c.UDPConn.Read(b)
+	raw := make([]byte, maxUDPDatagramSize)
+	n, err := c.UDPConn.Read(raw)
 	if err != nil {
 		return 0, err
 	}
-	d, err := NewDatagramFromBytes(b[0:n])
+	d, err := NewDatagramFromBytes(raw[0:n])
 	if err != nil {
 		return 0, err
 	}
-	n = copy(b, d.Data)
-	return n, nil
+	if len(d.Data) > len(b) {
+		copy(b, d.Data[:len(b)])
+		return len(b), io.ErrShortBuffer
+	}
+	return copy(b, d.Data), nil
 }
 
 func (c *Client) Write(b []byte) (int, error) {
@@ -249,7 +259,16 @@ func (c *Client) LocalAddr() net.Addr {
 }
 
 func (c *Client) RemoteAddr() net.Addr {
-	return c.RemoteAddress
+	if c.RemoteAddress != nil {
+		return c.RemoteAddress
+	}
+	if c.UDPConn != nil {
+		return c.UDPConn.RemoteAddr()
+	}
+	if c.TCPConn != nil {
+		return c.TCPConn.RemoteAddr()
+	}
+	return nil
 }
 
 func (c *Client) SetDeadline(t time.Time) error {
@@ -396,6 +415,42 @@ func contextError(ctx context.Context, err error) error {
 		}
 	}
 	return err
+}
+
+func resolveClientRemoteAddr(network, address string) net.Addr {
+	host, portRaw, err := net.SplitHostPort(address)
+	if err != nil {
+		return stringAddr{network: network, address: address}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return stringAddr{network: network, address: address}
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil {
+		return stringAddr{network: network, address: address}
+	}
+	switch network {
+	case "udp", "udp4", "udp6":
+		return &net.UDPAddr{IP: ip, Port: port}
+	case "tcp", "tcp4", "tcp6":
+		return &net.TCPAddr{IP: ip, Port: port}
+	default:
+		return stringAddr{network: network, address: address}
+	}
+}
+
+type stringAddr struct {
+	network string
+	address string
+}
+
+func (a stringAddr) Network() string {
+	return a.network
+}
+
+func (a stringAddr) String() string {
+	return a.address
 }
 
 func (c *Client) Request(r *Request) (*Reply, error) {
