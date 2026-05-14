@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type Client struct {
 	TCPTimeout    int
 	UDPTimeout    int
 	Dst           string
+	addrMu        sync.RWMutex
 }
 
 // This is just create a client, you need to use Dial to create conn
@@ -208,6 +210,7 @@ func (c *Client) Read(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	c.pinUDPDestination(d)
 	if len(d.Data) > len(b) {
 		copy(b, d.Data[:len(b)])
 		return len(b), io.ErrShortBuffer
@@ -219,7 +222,7 @@ func (c *Client) Write(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Write(b)
 	}
-	a, h, p, err := ParseAddress(c.Dst)
+	a, h, p, err := ParseAddress(c.udpDestination())
 	if err != nil {
 		return 0, err
 	}
@@ -259,8 +262,11 @@ func (c *Client) LocalAddr() net.Addr {
 }
 
 func (c *Client) RemoteAddr() net.Addr {
-	if c.RemoteAddress != nil {
-		return c.RemoteAddress
+	c.addrMu.RLock()
+	remoteAddress := c.RemoteAddress
+	c.addrMu.RUnlock()
+	if remoteAddress != nil {
+		return remoteAddress
 	}
 	if c.UDPConn != nil {
 		return c.UDPConn.RemoteAddr()
@@ -269,6 +275,42 @@ func (c *Client) RemoteAddr() net.Addr {
 		return c.TCPConn.RemoteAddr()
 	}
 	return nil
+}
+
+func (c *Client) udpDestination() string {
+	c.addrMu.RLock()
+	dst := c.Dst
+	c.addrMu.RUnlock()
+	return dst
+}
+
+func (c *Client) pinUDPDestination(d *Datagram) {
+	dst := d.Address()
+	if dst == "" {
+		return
+	}
+	c.addrMu.Lock()
+	defer c.addrMu.Unlock()
+	if !shouldPinUDPDestination(c.Dst, dst) {
+		return
+	}
+	c.Dst = dst
+	network := "udp"
+	if c.RemoteAddress != nil {
+		network = c.RemoteAddress.Network()
+	}
+	c.RemoteAddress = resolveClientRemoteAddr(network, dst)
+}
+
+func shouldPinUDPDestination(current, received string) bool {
+	if current == "" || received == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(current)
+	if err != nil {
+		return false
+	}
+	return net.ParseIP(host) == nil
 }
 
 func (c *Client) SetDeadline(t time.Time) error {

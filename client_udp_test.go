@@ -54,6 +54,70 @@ func TestClientUDPReadReportsShortBufferAfterUnwrapping(t *testing.T) {
 	}
 }
 
+func TestClientUDPReadPinsDomainDestinationToResponseAddress(t *testing.T) {
+	payload := []byte{0x84, 0x01, 0x02, 0x03}
+	responseAddress := []byte{203, 0, 113, 7}
+	port := []byte{0x4a, 0xbc}
+	raw := NewDatagram(ATYPIPv4, responseAddress, port, payload).Bytes()
+	var writes [][]byte
+	client := &Client{
+		UDPConn:       stubPacketConn{readData: raw, writeData: &writes},
+		Dst:           "geo.example.net:19132",
+		RemoteAddress: stringAddr{network: "udp", address: "geo.example.net:19132"},
+	}
+
+	buf := make([]byte, len(payload))
+	if _, err := client.Read(buf); err != nil {
+		t.Fatalf("Read error = %v", err)
+	}
+	if got := client.Dst; got != "203.0.113.7:19132" {
+		t.Fatalf("Dst after read = %q, want 203.0.113.7:19132", got)
+	}
+	if got := client.RemoteAddr().String(); got != "203.0.113.7:19132" {
+		t.Fatalf("RemoteAddr after read = %q, want 203.0.113.7:19132", got)
+	}
+
+	if _, err := client.Write([]byte{0x09}); err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("writes = %d, want 1", len(writes))
+	}
+	written, err := NewDatagramFromBytes(writes[0])
+	if err != nil {
+		t.Fatalf("written datagram: %v", err)
+	}
+	if written.Atyp != ATYPIPv4 {
+		t.Fatalf("written atyp = %#x, want IPv4", written.Atyp)
+	}
+	if got := written.Address(); got != "203.0.113.7:19132" {
+		t.Fatalf("written address = %q, want 203.0.113.7:19132", got)
+	}
+}
+
+func TestClientUDPReadDoesNotPinIPDestination(t *testing.T) {
+	payload := []byte{0x84, 0x01, 0x02, 0x03}
+	raw := NewDatagram(
+		ATYPIPv4,
+		[]byte{203, 0, 113, 7},
+		[]byte{0x4a, 0xbc},
+		payload,
+	).Bytes()
+	client := &Client{
+		UDPConn:       stubPacketConn{readData: raw},
+		Dst:           "198.51.100.4:19132",
+		RemoteAddress: &net.UDPAddr{IP: net.IPv4(198, 51, 100, 4), Port: 19132},
+	}
+
+	buf := make([]byte, len(payload))
+	if _, err := client.Read(buf); err != nil {
+		t.Fatalf("Read error = %v", err)
+	}
+	if got := client.Dst; got != "198.51.100.4:19132" {
+		t.Fatalf("Dst after read = %q, want 198.51.100.4:19132", got)
+	}
+}
+
 func TestClientRemoteAddrDefaultsToTargetAddress(t *testing.T) {
 	oldDialTCP := DialTCP
 	oldDialUDP := DialUDP
@@ -108,14 +172,18 @@ func TestResolveClientRemoteAddr(t *testing.T) {
 type stubPacketConn struct {
 	remoteAddr net.Addr
 	readData   []byte
+	writeData  *[][]byte
 }
 
 func (s stubPacketConn) Read(b []byte) (int, error) {
 	return copy(b, s.readData), nil
 }
 
-func (s stubPacketConn) Write([]byte) (int, error) {
-	return 0, nil
+func (s stubPacketConn) Write(b []byte) (int, error) {
+	if s.writeData != nil {
+		*s.writeData = append(*s.writeData, append([]byte(nil), b...))
+	}
+	return len(b), nil
 }
 
 func (s stubPacketConn) Close() error {
